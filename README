@@ -1,0 +1,155 @@
+Autor: Bogdan Ciobanu
+Grupa: 335CA
+
+                                ~Tema 2 ASC~
+                            ~ Optimizari de cod~
+
+-~-~-~-~-~-~-~-~-~-~-~-~-~-~DESCRIERE IMPLEMENTARI-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~
+
+* Varianta BLAS:
+    Am folosit functiile `dtrmm` si `dgemm` din BLAS. Pentru a pastra un
+    cache locality relativ bun, am mers cu ordinea operatiilor urmatoare:
+    1. C   =  A' * A
+    2. aux =   A * B
+    3. C   = aux * B' + C
+    Astfel, matricile A si B sunt folosite in calcule consecutive, avand
+    sanse mai mari sa nu fi fost evacuate din cache intre timp.
+
+* Varianta neoptima:
+    Am pastrat aceeasi ordine a operatiilor precum in solutia cu BLAS,
+    iar algoritmul de inmultire utilizat a fost cel naiv, cu ordinea buclelor
+    i-j-k. Modificarea adusa algoritmului naiv pentru inmultirea cu o matrice
+    triunghiulara, este punctul de incepere a lui k, care va incepe de la
+    elementul de pe diagonala principala a matricei din stanga, deci de la i.
+    Pentru inmultirea A' * A, o alta optimizare care poate fi facuta,
+    avand in vedere ca orice inmultire T' * T/T * T' va crea o matrice simetrica
+    este ca nu mai este necesara calcularea valorilor de sub diagonala
+    principala, ele fiind date de ecuatia C[j][i] = C[i][j].
+
+* Varianta optima:
+    Plecand de la ideile variantei neoptime, se pot face urmatoarele observatii:
+    - Pentru A' * A si A * B, ordinea i-j-k nu este optima, iar datorita
+        faptului ca formula lui k depinde de i, singura varianta optima este
+        ordinea i-k-j.
+    - Pentru (A * B) * B', i-j-k este ordinea optima, datorita faptului ca
+        matricea B este in forma sa transpusa, formula de inmultire ar fi
+        C[i][j] += (A * B)[i][k] * B[j][k]. Daca bucla din interior ar fi
+        i sau j, nu am mai avea acces secvential la memorie, astfel ca
+        i-j-k este optim in acest caz.
+    - Inmultirile A' * A si A * B sunt independente unele de celelalte, deci
+        putem fuziona buclele i si k ale lor. i-ul va fi acelasi pentru ambele,
+        dar A' * A va face calcule doar pentru k < i, iar A * B de la k >= i.
+    - Tot pentru A' * A si A * B, operatiile au acces de tip
+        secvential += constant * secvential. Astfel, putem incarca intr-un
+        registru valoarea constanta, si sa incrementam adresele din matricile
+        asociate, fara a fi nevoie sa recalculam pozitia la fiecare iteratie.
+        In sprijinul acestui demers, toti pointerii utilizati au fost marcati
+        ca `__restricted__`, pentru a semnala compilatorului ca acestia vor
+        pointa aceeasi zona de memorie pe tot decursul functiei, deci nu este
+        nevoie incarcari succesive ale adresei acestora.
+        Obs: datorita optimizarii de formula pentru A' * A, vom mai face un
+        acces aditional la memorie, care nu va fi secvential, ci va merge din
+        N in N, pentru a atribui lui A[j][i] = A[i][j].
+    - Inmultirea (A * B) * B' are o forma de acces de tipul
+        constant += secvential * secvential. Astfel ca, utilizam un registru
+        acumulator pentru a evita accese inutile la memorie, iar pentru
+        accesele secventiale ne folosim tot de incrementarea adreselor
+        (unde s-a fortat obtinerea prin `lea`, atribuirile de tipul
+        `pb = A + i * N + j` genereaza instructiuni assembly inutile).
+    - In loc de loop tiling, am facut loop unrolling manual, astfel incat la
+        fiecare iteratie sa se foloseasca exact un cache line. Empiric am
+        observat ca aceasta optimizare aduce un performance gain mult mai mare
+        decat tiling-ul, probabil datorita eliminarii tuturor instructiunilor
+        de jump si compare care ar venit cu tiling-ul.
+    - Datorita faptului ca programul este compilat pentru amd64, deci are un
+        numar mai mare de registri disponibili, am gasit un sweet spot
+        de variabile de tip registru, in care variabilele de tip iterator,
+        pointer si offset sunt declarati ca registri, iar matricile, mai putin
+        cele auxiliare, si ele sunt tinute in registri. Matricile auxiliare
+        nu ar fi beneficiat de vreun performance gain daca erau tinute in
+        registri, pentru ca erau accesate de maxim N ori, si empiric
+        s-a putut observa ca acestea ar crea un overhead prin ocuparea unor
+        registri inutil.
+    - Am utilizat in buclele din interior cache prefetching, despre care voi
+        detalia la sectiunea despre cachegrind.
+    - Pentru a trece de pragul de 5s pentru testul de N=1200, a fost necesara
+        scrierea manuala a instructiunilor din buclele interioare A * B si
+        (A * B) * B', in assembly, trecute in SSE. Functiile ia32 intrinsics
+        au un overhead datorat unor conversii, si se pare ca gcc-ul nu stie
+        nici el prea bine sa le foloseasca pe -O0. Motivatia a fost ca oricum
+        operatiile cu double se executa pe registrii XMM, doar ca in modul
+        single double. Am facut conversia de la single double la packed double,
+        injumatatind astfel accesele la memorie, si timpii de calcul pentru
+        aceste bucle. Am testat de asemenea si performanta functiilor AVX pentru
+        128 de biti, dar se pare ca au un overhead putin mai mare decat SSE-ul.
+        De asemenea am testat si functii AVX256, dar se pare ca matricile A si B
+        nu au fost aliniate la 32 de bytes, ceea ce este necesar pentru
+        load-urile cu `vmovapd`. Nu am testat performanta cu `vmovupd`, dar
+        ma astept sa nu fie un gain spectaculos, dat fiind ca accesul la zone
+        nealiniate are un overhead foarte mare.
+    - De asemenea, dupa ce am facut profiling pentru branch prediction,
+        am adaugat si cateva hint-uri compilatorului legat de bucle, si
+        ce predictii ar trebui sa faca pentru fiecare. La modul general,
+        pentru majoritatea jump-urilor, compilatorul ar trebui sa se astepte
+        ca acestea sa se intample, explicatia fiind ca, spre exemplu, pentru
+        N=1200, jump-ul se intampla de 1200 de ori, si o singura data va fi
+        epurat Icache-ul, ceea ce este o rata suficient de mica.
+
+-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~CACHEGRIND-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~
+* Varianta neoptimizata:
+    - Procentajele de 1.6% D1 miss rate, 0% LLd miss rate si 0.4% misprediction
+        arata bine, cu toate acestea, aceste numere nu reflecta faptul ca
+        s-au facut foarte multe accese la memorie si iteratii care nu ar fi
+        necesare. 2.532MM referinte la memorie, pentru operatii cu matrici
+        400x400 este un numar foarte mare, si asta este una dintre cauzele
+        performantei scazute ale acestei variante.
+
+* Varianta optimizata:
+    - Situatia este inversa fata de varianta neoptimizata, in care procentajele
+        de cache miss si mispredict sunt foarte mari, dar referintele la memorie
+        numarul de iteratii, dar si numarul de cache miss-uri este uneori cu
+        un ordin de marime mai mic. Aceste numere reflecta doar o fateta a
+        performantei, intrucat, desi fara prefetching aceste numere sunt doar
+        marginal mai proaste, prefetching-ul pe care l-am inserat in cod
+        aduce gain-uri de 1-2s pe coada nehalem. Probabil ca o strategie de
+        prefetching mai proactiva (prefetch cu ~3-4 iteratii inainte) ar
+        reduce performante si mai bune, dar ar necesita mult profiling. De
+        asemenea, exista posibilitatea ca `cachegrind`-ul sa nu stie
+        sa interpreteze instructiunile de prefetch, astfel ca doar empiric
+        putem observa impactul acestora.
+
+* BLAS:
+    - BLAS-ul contine probabil cod care poate sa se utilizeze de toate
+        capabilitatile de vectorizare a matricilor, ceea ce am facut in
+        varianta optimizata intr-un mod selectiv. Aceste vectorizari
+        se vad in numarul foarte redus de referinte la memorie. De asemenea,
+        miss rate-ul algoritmilor lor este foarte mic, probabil datorat faptului
+        ca utilizeaza o varianta de Strassen, care inerent rezolva problema
+        loop tiling-ului. Cu toate acestea, varianta optimizata pe care am
+        scris-o, are un L2 cache hit rate mai bun decat cel al BLAS-ului.
+
+-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~ANALIZA PERFORMANTEI-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~
+    Individual, fiecare implementare descrie o curba a ecuatiei x^3, asa cum
+    era de asteptat, dar constantele difera. Varianta naiva neoptimizata a
+    inmultirii de matrici are constanta cea mai mare, avand un timp de
+    aprox. 26s pentru testul N=1200. Faptul ca aceasta varianta are
+    cele mai slabe performante era de asteptat, dat fiind accesul neoptim
+    la memorie inerent ordonarii i-j-k pentru cazul general.
+    Varianta BLAS a acestei ecuatii obtine performantele cele mai bune,
+    precum se observa si din analiza cu cachegrind. Dat fiind numarul de alocari
+    al algoritmilor (extras din rularea cu memcheck), putem face un educated
+    guess la faptul ca in spate se foloseste o variatie de Strassen cu alocari
+    dinamice pe fiecare nivel de recursivitate, fapt ce incurajeaza paralelismul
+    (care a fost inhibat in testele de fata). Cu toate acestea, vectorizarea
+    codului, hit rate-ul si misprediction rate-ul bun, dau o viteza foarte mare
+    acestei implementari.
+    In ultimul rand, varianta optimizata a inmultirii naive obtine performante
+    mult mai bune decat varianta neoptimizata, in concordanta cu aproximarile
+    din [1], fiind un improvement de aprox. x10. Desi se apropie ca timpi
+    de varianta BLAS, aceasta pare ca scaleaza mai bine pentru N >>, datorita
+    complexitatii algoritmului Strassen, fiind o exponentiala ceva mai lina
+    decat x^3.
+
+    Per total, cele mai mari imbunatatiri observate empiric au fost reordonarea
+    buclelor ~x3, loop unrolling-ul ~x2 si trecerea la instructiuni SSE packed
+    ~x2.
